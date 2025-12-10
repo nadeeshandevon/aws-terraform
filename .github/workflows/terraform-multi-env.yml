@@ -1,0 +1,94 @@
+name: Terraform Multi-Environment Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "terraform/environments/dev/**"
+      - "terraform/environments/stage/**"
+      - "terraform/environments/prod/**"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "terraform/environments/**"
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      TF_IN_AUTOMATION: true
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Determine environment based on changed folder
+      - name: Set environment name
+        id: env
+        run: |
+          if [[ "${{ github.event.path }}" == *"/dev/"* ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.path }}" == *"/stage/"* ]]; then
+            echo "env=stage" >> $GITHUB_OUTPUT
+          else
+            echo "env=prod" >> $GITHUB_OUTPUT
+          fi
+
+      # Configure AWS (OIDC best practice)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Change to environment directory
+      - name: Change directory
+        run: cd terraform/environments/${{ steps.env.outputs.env }}
+
+      # Setup Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      # Backend init
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ steps.env.outputs.env }}
+        run: terraform init \
+          -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+          -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB }}" \
+          -backend-config="key=${{ steps.env.outputs.env }}/terraform.tfstate"
+
+      # Format check
+      - name: Terraform Format
+        working-directory: terraform/environments/${{ steps.env.outputs.env }}
+        run: terraform fmt -check
+
+      # Validate
+      - name: Terraform Validate
+        working-directory: terraform/environments/${{ steps.env.outputs.env }}
+        run: terraform validate
+
+      # Plan
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ steps.env.outputs.env }}
+        run: terraform plan -out=tfplan
+
+      # Upload plan to pipeline logs
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ steps.env.outputs.env }}
+          path: terraform/environments/${{ steps.env.outputs.env }}/tfplan
+
+      # Apply only when directly pushing to main, not for PRs
+      - name: Terraform Apply
+        if: github.event_name == 'push'
+        working-directory: terraform/environments/${{ steps.env.outputs.env }}
+        run: terraform apply -auto-approve tfplan
