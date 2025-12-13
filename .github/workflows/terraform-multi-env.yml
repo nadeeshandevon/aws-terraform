@@ -4,19 +4,125 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "terraform/environments/dev/**"
-      - "terraform/environments/stage/**"
-      - "terraform/environments/prod/**"
+      - "environments/dev/**"
+      - "environments/stage/**"
+      - "environments/prod/**"
+      - "modules/**"
   pull_request:
     branches: [ "main" ]
     paths:
-      - "terraform/environments/**"
+      - "environments/**"
+      - "modules/**"
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
 
 jobs:
-  terraform:
+  detect-environments:
     runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set-envs.outputs.environments }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      - name: Detect changed environments
+        id: set-envs
+        run: |
+          ENV_ARRAY="[]"
+          
+          # Check for manual workflow dispatch
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV_ARRAY="[\"${{ github.event.inputs.environment }}\"]"
+          else
+            # Detect changed environments from file changes
+            CHANGED_ENVS=""
+            
+            # For push events
+            if [ "${{ github.event_name }}" == "push" ]; then
+              if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^environments/dev/"; then
+                CHANGED_ENVS="${CHANGED_ENVS}dev "
+              fi
+              if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^environments/stage/"; then
+                CHANGED_ENVS="${CHANGED_ENVS}stage "
+              fi
+              if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^environments/prod/"; then
+                CHANGED_ENVS="${CHANGED_ENVS}prod "
+              fi
+            fi
+            
+            # For PRs, check changed files
+            if [ "${{ github.event_name }}" == "pull_request" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }})
+              if echo "$CHANGED_FILES" | grep -q "^environments/dev/"; then
+                CHANGED_ENVS="${CHANGED_ENVS}dev "
+              fi
+              if echo "$CHANGED_FILES" | grep -q "^environments/stage/"; then
+                CHANGED_ENVS="${CHANGED_ENVS}stage "
+              fi
+              if echo "$CHANGED_FILES" | grep -q "^environments/prod/"; then
+                CHANGED_ENVS="${CHANGED_ENVS}prod "
+              fi
+            fi
+            
+            # If modules changed, check all environments
+            if [ "${{ github.event_name }}" == "push" ]; then
+              if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^modules/"; then
+                if [ -z "$CHANGED_ENVS" ]; then
+                  CHANGED_ENVS="dev stage prod "
+                fi
+              fi
+            elif [ "${{ github.event_name }}" == "pull_request" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }})
+              if echo "$CHANGED_FILES" | grep -q "^modules/"; then
+                if [ -z "$CHANGED_ENVS" ]; then
+                  CHANGED_ENVS="dev stage prod "
+                fi
+              fi
+            fi
+            
+            # Convert to JSON array manually
+            if [ -n "$CHANGED_ENVS" ]; then
+              CHANGED_ENVS=$(echo $CHANGED_ENVS | xargs)
+              # Build JSON array
+              ENV_ARRAY="["
+              FIRST=true
+              for env in $CHANGED_ENVS; do
+                if [ "$FIRST" = true ]; then
+                  ENV_ARRAY="${ENV_ARRAY}\"$env\""
+                  FIRST=false
+                else
+                  ENV_ARRAY="${ENV_ARRAY},\"$env\""
+                fi
+              done
+              ENV_ARRAY="${ENV_ARRAY}]"
+            fi
+          fi
+          
+          # Default to dev if no environments detected
+          if [ "$ENV_ARRAY" == "[]" ]; then
+            ENV_ARRAY="[\"dev\"]"
+          fi
+          
+          echo "environments=$ENV_ARRAY" >> $GITHUB_OUTPUT
+          echo "Detected environments: $ENV_ARRAY"
+
+  terraform:
+    needs: detect-environments
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-environments.outputs.environments) }}
+    
     permissions:
       id-token: write
       contents: read
@@ -29,18 +135,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Determine environment based on changed folder
-      - name: Set environment name
-        id: env
-        run: |
-          if [[ "${{ github.event.path }}" == *"/dev/"* ]]; then
-            echo "env=dev" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event.path }}" == *"/stage/"* ]]; then
-            echo "env=stage" >> $GITHUB_OUTPUT
-          else
-            echo "env=prod" >> $GITHUB_OUTPUT
-          fi
-
       # Configure AWS (OIDC best practice)
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -48,48 +142,49 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Change to environment directory
-      - name: Change directory
-        run: cd terraform/environments/${{ steps.env.outputs.env }}
-
       # Setup Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.8.0"
+          terraform_wrapper: false
 
       # Backend init
       - name: Terraform Init
-        working-directory: terraform/environments/${{ steps.env.outputs.env }}
-        run: terraform init \
-          -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
-          -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB }}" \
-          -backend-config="key=${{ steps.env.outputs.env }}/terraform.tfstate"
+        working-directory: environments/${{ matrix.environment }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB }}" \
+            -backend-config="key=${{ matrix.environment }}/terraform.tfstate" \
+            -reconfigure
 
       # Format check
-      - name: Terraform Format
-        working-directory: terraform/environments/${{ steps.env.outputs.env }}
-        run: terraform fmt -check
+      - name: Terraform Format Check
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform fmt -check -recursive
 
       # Validate
       - name: Terraform Validate
-        working-directory: terraform/environments/${{ steps.env.outputs.env }}
+        working-directory: environments/${{ matrix.environment }}
         run: terraform validate
 
       # Plan
       - name: Terraform Plan
-        working-directory: terraform/environments/${{ steps.env.outputs.env }}
-        run: terraform plan -out=tfplan
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform plan -out=tfplan -no-color
+        continue-on-error: false
 
       # Upload plan to pipeline logs
       - name: Upload Terraform Plan
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan-${{ steps.env.outputs.env }}
-          path: terraform/environments/${{ steps.env.outputs.env }}/tfplan
+          name: tfplan-${{ matrix.environment }}
+          path: environments/${{ matrix.environment }}/tfplan
+          retention-days: 5
 
       # Apply only when directly pushing to main, not for PRs
       - name: Terraform Apply
-        if: github.event_name == 'push'
-        working-directory: terraform/environments/${{ steps.env.outputs.env }}
-        run: terraform apply -auto-approve tfplan
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        working-directory: environments/${{ matrix.environment }}
+        run: terraform apply -auto-approve -no-color tfplan
