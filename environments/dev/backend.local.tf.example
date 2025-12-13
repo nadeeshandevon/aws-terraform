@@ -1,0 +1,9 @@
+# Example: Rename this file to backend.local.tf to use local state for development
+# This will override the S3 backend configuration
+# 
+# terraform {
+#   backend "local" {
+#     path = "terraform.tfstate"
+#   }
+# }
+
